@@ -6,12 +6,13 @@
 //
 
 import SwiftUI
+import Photos
 
 @main
 struct favoritePicsApp: App {
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            PermissionsView()
         }
     }
 }
