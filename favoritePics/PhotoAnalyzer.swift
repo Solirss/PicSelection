@@ -12,7 +12,16 @@ enum PhotoAccessStatus {
     var isPermanentlyDenied: Bool { self == .denied || self == .restricted }
 }
 
-// MARK: - Photo Item
+// MARK: - FingerprintedAsset
+// Lightweight pair — fingerprint (~2 KB) only, no CGImage.
+
+struct FingerprintedAsset {
+    let asset: PHAsset
+    let fingerprint: VNFeaturePrintObservation
+}
+
+// MARK: - PhotoItem
+// Only created for the small set of photos that won a cluster.
 
 struct PhotoItem {
     let asset: PHAsset
@@ -21,17 +30,11 @@ struct PhotoItem {
 }
 
 // MARK: - PhotoAnalyzer
-// ObservableObject so it can be used with @StateObject in PermissionsView.
-// All mutations happen before any UI reads them, so there are no data races.
 
 class PhotoAnalyzer: ObservableObject {
     let objectWillChange = ObservableObjectPublisher()
 
-    // Written once on a background thread in buildTasteProfile(),
-    // then only read afterward — safe in practice.
     private(set) var tasteProfile: [VNFeaturePrintObservation] = []
-
-    // CIContext is thread-safe for concurrent rendering.
     private let ciContext = CIContext(options: [.workingColorSpace: NSNull()])
 
     // MARK: - 1. Photo Access
@@ -51,25 +54,22 @@ class PhotoAnalyzer: ObservableObject {
         }
     }
 
-    // MARK: - 2. Fingerprint
+    // MARK: - 2. Fingerprint a single CGImage
 
-    func generateFingerprint(for cgImage: CGImage) async -> VNFeaturePrintObservation? {
-        await Task.detached(priority: .userInitiated) {
-            let request = VNGenerateImageFeaturePrintRequest()
-            request.imageCropAndScaleOption = .scaleFill
-            let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
-            do {
-                try handler.perform([request])
-                return request.results?.first as? VNFeaturePrintObservation
-            } catch {
-                print("Fingerprint error: \(error.localizedDescription)")
-                return nil
-            }
-        }.value
+    func generateFingerprint(for cgImage: CGImage) -> VNFeaturePrintObservation? {
+        let request = VNGenerateImageFeaturePrintRequest()
+        request.imageCropAndScaleOption = .scaleFill
+        let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+        do {
+            try handler.perform([request])
+            return request.results?.first as? VNFeaturePrintObservation
+        } catch {
+            print("Fingerprint error: \(error.localizedDescription)")
+            return nil
+        }
     }
 
     // MARK: - 3. Sharpness (Laplacian Variance)
-    // Returns a score where higher = sharper. Below ~0.015 is visibly blurry.
 
     func calculateSharpness(ciImage: CIImage) -> Float {
         guard let conv = CIFilter(name: "CIConvolution3X3") else { return 0 }
@@ -95,7 +95,6 @@ class PhotoAnalyzer: ObservableObject {
     }
 
     // MARK: - 4. Distance
-    // Lower = more similar. <0.15 duplicate, 0.15-0.40 similar, >0.40 different.
 
     func computeDistance(between a: VNFeaturePrintObservation,
                          and b: VNFeaturePrintObservation) -> Float? {
@@ -104,13 +103,11 @@ class PhotoAnalyzer: ObservableObject {
             try a.computeDistance(&distance, to: b)
             return distance
         } catch {
-            print("Distance error: \(error.localizedDescription)")
             return nil
         }
     }
 
     // MARK: - 5. Taste Profile
-    // No @MainActor here — we run fully on a detached background task.
 
     func buildTasteProfile(sampleLimit: Int = 100) async {
         let prints: [VNFeaturePrintObservation] = await Task.detached(priority: .userInitiated) {
@@ -155,7 +152,6 @@ class PhotoAnalyzer: ObservableObject {
     }
 
     // MARK: - 6. Taste Score
-    // Lower = closer to the user's taste = better match.
 
     func tasteScore(for fingerprint: VNFeaturePrintObservation) -> Float {
         guard !tasteProfile.isEmpty else { return Float.greatestFiniteMagnitude }
@@ -164,99 +160,129 @@ class PhotoAnalyzer: ObservableObject {
         return distances.reduce(0, +) / Float(distances.count)
     }
 
-    // MARK: - 7. Group Duplicates (Sliding Window + Union-Find)
+    // MARK: - 7. Fingerprint a specific batch of assets
+    //
+    // Each CGImage lives only inside its autoreleasepool iteration.
+    // After this returns, RAM holds only the fingerprints (~2 KB each).
+    // 250 photos × 2 KB = ~500 KB. The 250 CGImages (~1.5 GB) are all gone.
 
-    func groupDuplicates(
-            items: [PhotoItem],
-            threshold: Float = 0.35,
-            windowSize: Int = 10,
-            progress: ((Double) -> Void)? = nil
-        ) async -> [[PhotoItem]] {
+    func fingerprintBatch(
+        assets: [PHAsset],
+        progress: ((Double) -> Void)? = nil
+    ) async -> [FingerprintedAsset] {
 
-            let n = items.count
-            guard n > 1 else { return items.map { [$0] } }
-
-            var fingerprints: [VNFeaturePrintObservation?] = Array(repeating: nil, count: n)
-            
-            // FIX: Replaced withTaskGroup with a sequential loop
-            // This stops the Vision framework from deadlocking!
-            for (i, item) in items.enumerated() {
-                // Process one at a time
-                let fp = await self.generateFingerprint(for: item.cgImage)
-                fingerprints[i] = fp
-                
-                // Update progress safely
-                progress?(Double(i + 1) / Double(n))
-            }
-
-            var parent = Array(0..<n)
-            var rank   = Array(repeating: 0, count: n)
-
-            func find(_ x: Int) -> Int {
-                var x = x
-                while parent[x] != x { parent[x] = parent[parent[x]]; x = parent[x] }
-                return x
-            }
-            
-            func union(_ a: Int, _ b: Int) {
-                let ra = find(a), rb = find(b)
-                guard ra != rb else { return }
-                if rank[ra] < rank[rb]      { parent[ra] = rb }
-                else if rank[ra] > rank[rb] { parent[rb] = ra }
-                else                        { parent[rb] = ra; rank[ra] += 1 }
-            }
-
-            for i in 0..<(n-1) {
-                guard let fp1 = fingerprints[i] else { continue }
-                let windowEnd = min(i + windowSize, n - 1)
-                for j in (i + 1)...windowEnd {
-                    guard let fp2 = fingerprints[j] else { continue }
-                    if let dist = computeDistance(between: fp1, and: fp2), dist < threshold {
-                        union(i, j)
-                    }
-                }
-            }
-
-            var clusters: [Int: [PhotoItem]] = [:]
-            for i in 0..<n {
-                clusters[find(i), default: []].append(items[i])
-            }
-            return clusters.values.map { $0 }
-        }
-
-    // MARK: - 8. Fetch Recent Photos
-
-    func fetchRecentPhotoItems(limit: Int = 100) async -> [PhotoItem] {
         await Task.detached(priority: .userInitiated) {
-            let options = PHFetchOptions()
-            options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
-            options.fetchLimit = limit
-            options.predicate = NSPredicate(format: "mediaType == %d",
-                                            PHAssetMediaType.image.rawValue)
-
-            let assets = PHAsset.fetchAssets(with: options)
-            var items: [PhotoItem] = []
+            var results: [FingerprintedAsset] = []
+            results.reserveCapacity(assets.count)
 
             let imageOptions = PHImageRequestOptions()
             imageOptions.isSynchronous = true
-            imageOptions.deliveryMode = .highQualityFormat
-            imageOptions.resizeMode = .exact
+            // fastFormat = lower-res thumbnail, fine for fingerprinting,
+            // uses ~6x less RAM than highQualityFormat.
+            imageOptions.deliveryMode = .fastFormat
+            imageOptions.resizeMode = .fast
+            // Don't trigger iCloud downloads — use local copy only.
+            imageOptions.isNetworkAccessAllowed = false
 
-            assets.enumerateObjects { asset, _, _ in
+            for (index, asset) in assets.enumerated() {
+                autoreleasepool {
+                    var cgImage: CGImage?
+                    PHImageManager.default().requestImage(
+                        for: asset,
+                        targetSize: CGSize(width: 224, height: 224),
+                        contentMode: .aspectFill,
+                        options: imageOptions
+                    ) { image, _ in cgImage = image?.cgImage }
+
+                    guard let cg = cgImage else { return }
+
+                    let request = VNGenerateImageFeaturePrintRequest()
+                    request.imageCropAndScaleOption = .scaleFill
+                    let handler = VNImageRequestHandler(cgImage: cg, options: [:])
+
+                    if (try? handler.perform([request])) != nil,
+                       let fp = request.results?.first as? VNFeaturePrintObservation {
+                        results.append(FingerprintedAsset(asset: asset, fingerprint: fp))
+                    }
+                    // cg released here — autoreleasepool boundary
+                }
+                progress?(Double(index + 1) / Double(assets.count))
+            }
+            return results
+        }.value
+    }
+
+    // MARK: - 8. Group fingerprints (no images in RAM)
+
+    func groupFingerprintedAssets(
+        _ assets: [FingerprintedAsset],
+        threshold: Float = 0.35,
+        windowSize: Int = 10
+    ) -> [[FingerprintedAsset]] {
+
+        let n = assets.count
+        guard n > 1 else { return assets.map { [$0] } }
+
+        var parent = Array(0..<n)
+        var rank   = Array(repeating: 0, count: n)
+
+        func find(_ x: Int) -> Int {
+            var x = x
+            while parent[x] != x { parent[x] = parent[parent[x]]; x = parent[x] }
+            return x
+        }
+        func union(_ a: Int, _ b: Int) {
+            let ra = find(a), rb = find(b)
+            guard ra != rb else { return }
+            if rank[ra] < rank[rb]      { parent[ra] = rb }
+            else if rank[ra] > rank[rb] { parent[rb] = ra }
+            else                        { parent[rb] = ra; rank[ra] += 1 }
+        }
+
+        for i in 0..<n {
+            let windowEnd = min(i + windowSize, n - 1)
+            for j in (i)...windowEnd {
+                if let dist = computeDistance(between: assets[i].fingerprint,
+                                              and: assets[j].fingerprint), dist < threshold {
+                    union(i, j)
+                }
+            }
+        }
+
+        var clusters: [Int: [FingerprintedAsset]] = [:]
+        for i in 0..<n {
+            clusters[find(i), default: []].append(assets[i])
+        }
+        return clusters.values.map { $0 }
+    }
+
+    // MARK: - 9. Resolve a cluster into PhotoItems for scoring
+    //
+    // Only called for the small winner set inside each batch.
+
+    func resolveCluster(_ cluster: [FingerprintedAsset]) -> [PhotoItem] {
+        let imageOptions = PHImageRequestOptions()
+        imageOptions.isSynchronous = true
+        imageOptions.deliveryMode = .highQualityFormat
+        imageOptions.resizeMode = .exact
+
+        var items: [PhotoItem] = []
+        for fa in cluster {
+            autoreleasepool {
                 var cgImage: CGImage?
                 PHImageManager.default().requestImage(
-                    for: asset,
+                    for: fa.asset,
                     targetSize: CGSize(width: 512, height: 512),
                     contentMode: .aspectFill,
                     options: imageOptions
                 ) { image, _ in cgImage = image?.cgImage }
 
                 if let cg = cgImage {
-                    items.append(PhotoItem(asset: asset, cgImage: cg))
+                    items.append(PhotoItem(asset: fa.asset, cgImage: cg))
                 }
             }
-            return items
-        }.value
+        }
+        return items
     }
 
     // MARK: - Convenience
