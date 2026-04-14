@@ -177,7 +177,7 @@ class SmartStackViewModel: ObservableObject {
             for (item, fa) in zip(items, cluster) {
                 let uiImage  = await resolveDisplayImage(for: item.asset)
                 let sharpness = analyzer.calculateSharpness(ciImage: item.ciImage)
-                let score     = analyzer.tasteScore(for: fa.fingerprint)
+                let score     = analyzer.tasteScore(for: fa.fingerprint, cgImage: item.cgImage)
 
                 ranked.append(RankedPhoto(
                     id: item.asset.localIdentifier,
