@@ -52,6 +52,19 @@ struct SmartStack: Identifiable {
     }
 }
 
+// MARK: - PendingDeletion
+
+struct PendingDeletion: Identifiable {
+    let id: UUID = UUID()
+    let stack: SmartStack
+    let originalIndex: Int
+    let scheduledAt: Date
+    let undoWindow: TimeInterval
+
+    var deadline: Date { scheduledAt.addingTimeInterval(undoWindow) }
+    var photosCount: Int { stack.discardCount }
+}
+
 // MARK: - SmartStackViewModel
 
 @MainActor
@@ -67,6 +80,10 @@ class SmartStackViewModel: ObservableObject {
     @Published var totalBatches: Int = 0
     // True while the next batch is being processed in the background
     @Published var isLoadingNextBatch: Bool = false
+
+    // A deletion that's been requested but not yet committed to PhotoKit.
+    // Shown as an undo toast; commits after `undoWindow` seconds unless cancelled.
+    @Published var pendingDeletion: PendingDeletion? = nil
 
     enum LoadingPhase: Equatable {
         case idle
@@ -84,11 +101,14 @@ class SmartStackViewModel: ObservableObject {
     private let analyzer: PhotoAnalyzer
     private let batchSize: Int = 250
     private let sharpnessThreshold: Float = 0.015
+    private let undoWindow: TimeInterval = 5
 
     // All assets fetched once up front (cheap — metadata only)
     private var allAssets: [PHAsset] = []
     // Tracks which asset index the next batch starts from
     private var nextBatchOffset: Int = 0
+    // Drives the undo timer; cancelling aborts the pending PhotoKit delete.
+    private var undoTimerTask: Task<Void, Never>? = nil
 
     init(analyzer: PhotoAnalyzer) {
         self.analyzer = analyzer
@@ -240,15 +260,65 @@ class SmartStackViewModel: ObservableObject {
         stacks[idx].promote(photo)
     }
 
-    func keepHeroDeleteRest(in stack: SmartStack) async {
+    // Removes the stack from the view immediately and shows an undo banner.
+    // The actual PhotoKit deletion is delayed by `undoWindow` seconds so the
+    // user has a chance to take it back. Requesting a new deletion while one
+    // is pending commits the previous one straight away.
+    func requestKeepHeroDeleteRest(in stack: SmartStack) {
+        // Commit any in-flight pending deletion immediately so we never lose it.
+        if let prev = pendingDeletion {
+            undoTimerTask?.cancel()
+            undoTimerTask = nil
+            pendingDeletion = nil
+            Task { await self.commit(stack: prev.stack) }
+        }
+
+        guard let idx = stacks.firstIndex(where: { $0.id == stack.id }) else { return }
+        stacks.remove(at: idx)
+
+        let pending = PendingDeletion(
+            stack: stack,
+            originalIndex: idx,
+            scheduledAt: Date(),
+            undoWindow: undoWindow
+        )
+        pendingDeletion = pending
+
+        let id = pending.id
+        undoTimerTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64((self?.undoWindow ?? 5) * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            await self?.commitPendingIfStillCurrent(id: id)
+        }
+    }
+
+    func undoLastDeletion() {
+        guard let pending = pendingDeletion else { return }
+        undoTimerTask?.cancel()
+        undoTimerTask = nil
+        let insertIdx = min(pending.originalIndex, stacks.count)
+        stacks.insert(pending.stack, at: insertIdx)
+        pendingDeletion = nil
+    }
+
+    private func commitPendingIfStillCurrent(id: UUID) async {
+        guard let current = pendingDeletion, current.id == id else { return }
+        let stack = current.stack
+        pendingDeletion = nil
+        undoTimerTask = nil
+        await commit(stack: stack)
+    }
+
+    private func commit(stack: SmartStack) async {
         let toDelete = stack.discardTray.map(\.asset)
         do {
             try await PHPhotoLibrary.shared().performChanges {
                 PHAssetChangeRequest.deleteAssets(toDelete as NSFastEnumeration)
             }
-            stacks.removeAll { $0.id == stack.id }
         } catch {
-            phase = .error("Could not delete photos: \(error.localizedDescription)")
+            // PhotoKit refused the delete — log and move on. Re-inserting
+            // the card here would be jarring after the user already moved past it.
+            print("Delete failed: \(error.localizedDescription)")
         }
     }
 

@@ -75,6 +75,19 @@ private struct StackBrowser: View {
                 viewModel: viewModel
             )
         }
+        .overlay(alignment: .bottom) {
+            if let pending = viewModel.pendingDeletion {
+                UndoToast(pending: pending) {
+                    UIImpactFeedbackGenerator(style: .soft).impactOccurred()
+                    viewModel.undoLastDeletion()
+                }
+                .padding(.horizontal, 14)
+                .padding(.bottom, 8)
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+        }
+        .animation(.spring(response: 0.45, dampingFraction: 0.85),
+                   value: viewModel.pendingDeletion?.id)
     }
 
     // MARK: Header
@@ -234,7 +247,7 @@ private struct StackCard: View {
     @ObservedObject var viewModel: SmartStackViewModel
     let onOpenViewer: () -> Void
 
-    @State private var showDeleteConfirm = false
+    @State private var showCompare = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -256,18 +269,8 @@ private struct StackCard: View {
                 .padding(.horizontal, 16)
                 .padding(.bottom, 8)
         }
-        .confirmationDialog(
-            "Delete \(stack.discardCount) photo\(stack.discardCount == 1 ? "" : "s")?",
-            isPresented: $showDeleteConfirm,
-            titleVisibility: .visible
-        ) {
-            Button("Delete \(stack.discardCount) photo\(stack.discardCount == 1 ? "" : "s")",
-                   role: .destructive) {
-                Task { await viewModel.keepHeroDeleteRest(in: stack) }
-            }
-            Button("Cancel", role: .cancel) { }
-        } message: {
-            Text("The selected photo will be kept. This cannot be undone.")
+        .sheet(isPresented: $showCompare) {
+            CompareGridSheet(stackID: stack.id, viewModel: viewModel)
         }
     }
 
@@ -355,22 +358,42 @@ private struct StackCard: View {
 
     @ViewBuilder
     private var heroFooterText: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            if !stack.hero.isTopPick {
-                Button {
-                    if let aiPick = stack.photos.first(where: { $0.isTopPick }) {
-                        viewModel.promotePhoto(aiPick, in: stack)
-                    }
-                } label: {
-                    Label("Restore AI Pick", systemImage: "arrow.uturn.backward")
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 9)
-                        .padding(.vertical, 5)
-                        .background(.ultraThinMaterial, in: Capsule())
+        if !stack.hero.isTopPick {
+            Button {
+                if let aiPick = stack.aiPick {
+                    viewModel.promotePhoto(aiPick, in: stack)
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
                 }
-                .buttonStyle(.plain)
+            } label: {
+                Label("Restore AI Pick", systemImage: "arrow.uturn.backward")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 5)
+                    .background(.ultraThinMaterial, in: Capsule())
             }
+            .buttonStyle(.plain)
+        } else if let reason = pickReason(for: stack.hero, in: stack) {
+            Label(reason, systemImage: "lightbulb.fill")
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.white)
+                .padding(.horizontal, 9)
+                .padding(.vertical, 5)
+                .background(.ultraThinMaterial, in: Capsule())
+        }
+    }
+
+    private func pickReason(for hero: RankedPhoto, in stack: SmartStack) -> String? {
+        guard hero.isTopPick, stack.photos.count > 1 else { return nil }
+        let maxSharp = stack.photos.map(\.sharpness).max() ?? 0
+        let minTaste = stack.photos.map(\.tasteScore).min() ?? 0
+        let isSharpest = hero.sharpness == maxSharp
+        let isBestTaste = hero.tasteScore == minTaste
+        switch (isSharpest, isBestTaste) {
+        case (true, true):   return "Sharpest and best taste match"
+        case (true, false):  return "Sharpest in this group"
+        case (false, true):  return "Closest to your taste"
+        case (false, false): return "Best overall balance"
         }
     }
 
@@ -411,6 +434,18 @@ private struct StackCard: View {
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
                 Spacer()
+                Button {
+                    showCompare = true
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "rectangle.grid.2x2.fill")
+                            .font(.system(size: 10, weight: .semibold))
+                        Text("Compare")
+                            .font(.caption.weight(.semibold))
+                    }
+                    .foregroundStyle(.tint)
+                }
+                .buttonStyle(.plain)
             }
             .padding(.horizontal, 24)
 
@@ -455,7 +490,7 @@ private struct StackCard: View {
 
             Button {
                 UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-                showDeleteConfirm = true
+                viewModel.requestKeepHeroDeleteRest(in: stack)
             } label: {
                 Label("Keep best · Delete \(stack.discardCount)",
                       systemImage: "trash.fill")
@@ -975,6 +1010,209 @@ private struct ZoomablePhoto: View {
             let img = await viewModel.loadFullResolutionImage(for: photo.asset)
             if let img { highRes = img }
         }
+    }
+}
+
+// MARK: - UndoToast
+
+private struct UndoToast: View {
+    let pending: PendingDeletion
+    let onUndo: () -> Void
+
+    var body: some View {
+        HStack(spacing: 12) {
+            CountdownRing(deadline: pending.deadline, total: pending.undoWindow)
+                .frame(width: 22, height: 22)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Deleting \(pending.photosCount) photo\(pending.photosCount == 1 ? "" : "s")")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.white)
+                Text("Tap undo to keep them")
+                    .font(.caption2)
+                    .foregroundStyle(.white.opacity(0.75))
+            }
+
+            Spacer(minLength: 8)
+
+            Button(action: onUndo) {
+                Text("Undo")
+                    .font(.subheadline.weight(.bold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 8)
+                    .background(.white.opacity(0.18), in: Capsule())
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(
+            Capsule()
+                .fill(Color.black.opacity(0.88))
+        )
+        .shadow(color: .black.opacity(0.25), radius: 16, y: 6)
+    }
+}
+
+private struct CountdownRing: View {
+    let deadline: Date
+    let total: TimeInterval
+
+    var body: some View {
+        TimelineView(.animation) { context in
+            let remaining = max(0, deadline.timeIntervalSince(context.date))
+            let progress = total > 0 ? min(1, max(0, remaining / total)) : 0
+            ZStack {
+                Circle().stroke(.white.opacity(0.22), lineWidth: 2.5)
+                Circle()
+                    .trim(from: 0, to: progress)
+                    .stroke(.white,
+                            style: StrokeStyle(lineWidth: 2.5, lineCap: .round))
+                    .rotationEffect(.degrees(-90))
+            }
+        }
+    }
+}
+
+// MARK: - CompareGridSheet
+
+private struct CompareGridSheet: View {
+    let stackID: UUID
+    @ObservedObject var viewModel: SmartStackViewModel
+    @Environment(\.dismiss) private var dismiss
+
+    private var stack: SmartStack? {
+        viewModel.stacks.first(where: { $0.id == stackID })
+    }
+
+    var body: some View {
+        NavigationStack {
+            ZStack {
+                Color(.systemGroupedBackground).ignoresSafeArea()
+
+                if let stack {
+                    content(stack: stack)
+                } else {
+                    Color.clear.onAppear { dismiss() }
+                }
+            }
+            .navigationTitle("Compare")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Done") { dismiss() }
+                        .font(.body.weight(.semibold))
+                }
+            }
+        }
+    }
+
+    private func content(stack: SmartStack) -> some View {
+        let columns = [
+            GridItem(.flexible(), spacing: 14),
+            GridItem(.flexible(), spacing: 14)
+        ]
+
+        return ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                Text("Tap a photo to choose the one you'll keep.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 18)
+
+                LazyVGrid(columns: columns, spacing: 14) {
+                    ForEach(stack.photos) { photo in
+                        CompareTile(
+                            photo: photo,
+                            isSelected: photo.id == stack.hero.id
+                        ) {
+                            viewModel.promotePhoto(photo, in: stack)
+                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                        }
+                    }
+                }
+                .padding(.horizontal, 14)
+                .padding(.bottom, 24)
+            }
+            .padding(.top, 12)
+        }
+    }
+}
+
+private struct CompareTile: View {
+    let photo: RankedPhoto
+    let isSelected: Bool
+    let onTap: () -> Void
+
+    var body: some View {
+        Button(action: onTap) {
+            ZStack(alignment: .topLeading) {
+                Image(uiImage: photo.image)
+                    .resizable()
+                    .scaledToFill()
+                    .aspectRatio(1, contentMode: .fill)
+                    .frame(maxWidth: .infinity)
+                    .clipped()
+                    .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+
+                LinearGradient(
+                    colors: [.clear, .black.opacity(0.45)],
+                    startPoint: .center, endPoint: .bottom
+                )
+                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                .allowsHitTesting(false)
+
+                HStack {
+                    if photo.isTopPick {
+                        Label("AI Pick", systemImage: "sparkles")
+                            .font(.caption2.weight(.bold))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(
+                                LinearGradient(
+                                    colors: [.purple, .accentColor],
+                                    startPoint: .leading, endPoint: .trailing),
+                                in: Capsule()
+                            )
+                    }
+                    Spacer()
+                    if isSelected {
+                        Image(systemName: "checkmark.circle.fill")
+                            .font(.title3)
+                            .foregroundStyle(.white, Color.accentColor)
+                            .shadow(color: .black.opacity(0.4), radius: 4)
+                    }
+                }
+                .padding(10)
+
+                VStack {
+                    Spacer()
+                    HStack {
+                        if photo.sharpness < 0.015 {
+                            Label("Blurry", systemImage: "drop.triangle.fill")
+                                .font(.caption2.weight(.semibold))
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 7)
+                                .padding(.vertical, 3)
+                                .background(.orange, in: Capsule())
+                        }
+                        Spacer()
+                    }
+                    .padding(10)
+                }
+            }
+            .overlay(
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .stroke(isSelected ? Color.accentColor : Color.clear, lineWidth: 3)
+            )
+            .shadow(color: isSelected
+                    ? Color.accentColor.opacity(0.30)
+                    : Color.black.opacity(0.06),
+                    radius: isSelected ? 14 : 6, y: 4)
+        }
+        .buttonStyle(.plain)
     }
 }
 
