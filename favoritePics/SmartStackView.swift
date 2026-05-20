@@ -1,6 +1,8 @@
 import SwiftUI
 import Photos
 
+// MARK: - SmartStackView (root)
+
 struct SmartStackView: View {
     @ObservedObject var viewModel: SmartStackViewModel
 
@@ -10,30 +12,32 @@ struct SmartStackView: View {
 
             switch viewModel.phase {
             case .idle:
-                EmptyView()
+                Color.clear
 
             case .buildingProfile:
-                LoadingView(icon: "heart.fill",
-                            title: "Learning your taste",
-                            subtitle: "Analysing your Favorites album…")
+                StatusView(icon: "heart.fill",
+                           tint: .pink,
+                           title: "Learning your taste",
+                           subtitle: "Analyzing your Favorites album")
 
             case .scanning(let progress):
-                LoadingView(
-                    icon: "photo.stack",
-                    title: "Scanning batch \(viewModel.currentBatch) of \(viewModel.totalBatches)",
-                    subtitle: "Reading photos… \(Int(progress * 100))%",
-                    progress: progress
-                )
+                StatusView(icon: "rectangle.stack",
+                           tint: .accentColor,
+                           title: "Scanning your library",
+                           subtitle: "Batch \(viewModel.currentBatch) of \(viewModel.totalBatches) · \(Int(progress * 100))%",
+                           progress: progress)
 
             case .clustering:
-                LoadingView(icon: "sparkles",
-                            title: "Grouping similar photos",
-                            subtitle: "Comparing fingerprints…")
+                StatusView(icon: "square.grid.3x3.square",
+                           tint: .accentColor,
+                           title: "Finding similar shots",
+                           subtitle: "Comparing visual fingerprints")
 
             case .ranking:
-                LoadingView(icon: "star",
-                            title: "Ranking your best shots",
-                            subtitle: "Loading only the grouped photos…")
+                StatusView(icon: "sparkles",
+                           tint: .accentColor,
+                           title: "Ranking your best shots",
+                           subtitle: "Loading the photos that matter")
 
             case .error(let message):
                 ErrorView(message: message) {
@@ -41,145 +45,185 @@ struct SmartStackView: View {
                 }
 
             case .ready, .finished:
-                stackBrowser
+                StackBrowser(viewModel: viewModel)
             }
         }
         .task { await viewModel.run() }
     }
+}
 
-    // MARK: - Stack Browser
+// MARK: - StackBrowser
 
-    // BUG FIX 1 — Zoom bug
-    // The old TabView(.page) recalculates its entire geometry whenever
-    // new stacks are appended, causing a jarring scale/zoom animation.
-    // Replaced with a ScrollViewReader + LazyHStack so new cards are
-    // simply appended at the end without disturbing the existing layout.
+private struct StackBrowser: View {
+    @ObservedObject var viewModel: SmartStackViewModel
+    @State private var currentStackID: AnyHashable? = nil
+    @State private var fullScreenStack: SmartStack? = nil
 
-    @State private var currentStackID: UUID? = nil
-
-    private var stackBrowser: some View {
+    var body: some View {
         VStack(spacing: 0) {
-
-            // Header
-            HStack {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("\(viewModel.stacks.count) groups found")
-                        .font(.subheadline.weight(.semibold))
-                    Text("Batch \(viewModel.currentBatch) of \(viewModel.totalBatches)")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-                if viewModel.phase != .finished {
-                    Text("\(viewModel.totalBatches - viewModel.currentBatch) batches left")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 4)
-                        .background(.quaternary, in: Capsule())
-                }
-            }
-            .padding(.horizontal)
-            .padding(.top, 12)
-            .padding(.bottom, 8)
+            header
 
             if viewModel.stacks.isEmpty {
-                Spacer()
-                VStack(spacing: 16) {
-                    Image(systemName: "checkmark.circle")
-                        .font(.system(size: 48))
-                        .foregroundStyle(.secondary)
-                    Text("No duplicates in this batch")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                    if viewModel.hasMoreBatches {
-                        nextBatchButton
-                    } else {
-                        Text("Your library is clean!")
-                            .font(.subheadline.weight(.semibold))
-                            .foregroundStyle(.green)
-                    }
-                }
-                Spacer()
+                emptyState
             } else {
-                GeometryReader { geo in
-                    ScrollViewReader { proxy in
-                        ScrollView(.horizontal, showsIndicators: false) {
-                            LazyHStack(spacing: 0) {
-                                ForEach(viewModel.stacks) { stack in
-                                    StackCard(stack: stack, viewModel: viewModel)
-                                        .frame(width: geo.size.width)
-                                        .id(stack.id)
-                                }
+                cardPager
+            }
+        }
+        .fullScreenCover(item: $fullScreenStack) { snapshot in
+            FullScreenPhotoViewer(
+                stackID: snapshot.id,
+                viewModel: viewModel
+            )
+        }
+    }
 
-                                // "Load next batch" card — appended without
-                                // touching existing cards at all.
-                                if viewModel.hasMoreBatches {
-                                    nextBatchCard
-                                        .frame(width: geo.size.width)
-                                        .id("next-batch")
-                                }
-                            }
-                            // Snap card-by-card
-                            .scrollTargetLayout()
+    // MARK: Header
+
+    private var header: some View {
+        VStack(spacing: 10) {
+            HStack(alignment: .firstTextBaseline) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Smart Picks")
+                        .font(.title2.weight(.bold))
+                    Text(headerSubtitle)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                statusChip
+            }
+
+            progressBar
+        }
+        .padding(.horizontal, 20)
+        .padding(.top, 8)
+        .padding(.bottom, 14)
+    }
+
+    private var headerSubtitle: String {
+        if viewModel.stacks.isEmpty { return "No groups in view" }
+        let current = stackPosition
+        return "Group \(current) of \(viewModel.stacks.count)"
+    }
+
+    private var stackPosition: Int {
+        guard let id = currentStackID,
+              let idx = viewModel.stacks.firstIndex(where: { AnyHashable($0.id) == id })
+        else { return 1 }
+        return idx + 1
+    }
+
+    @ViewBuilder
+    private var statusChip: some View {
+        if viewModel.phase == .finished {
+            Label("Scan complete", systemImage: "checkmark.seal.fill")
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.green)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(.green.opacity(0.12), in: Capsule())
+        } else if viewModel.isLoadingNextBatch {
+            HStack(spacing: 6) {
+                ProgressView().controlSize(.mini)
+                Text("Loading…").font(.caption2.weight(.semibold))
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background(.quaternary, in: Capsule())
+        } else {
+            Label("\(viewModel.totalBatches - viewModel.currentBatch) batches left",
+                  systemImage: "rectangle.stack")
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(.quaternary, in: Capsule())
+        }
+    }
+
+    private var progressBar: some View {
+        GeometryReader { geo in
+            ZStack(alignment: .leading) {
+                Capsule()
+                    .fill(Color.secondary.opacity(0.12))
+                Capsule()
+                    .fill(LinearGradient(
+                        colors: [.accentColor, .accentColor.opacity(0.7)],
+                        startPoint: .leading, endPoint: .trailing))
+                    .frame(width: geo.size.width * scanProgress)
+                    .animation(.easeInOut(duration: 0.4), value: scanProgress)
+            }
+        }
+        .frame(height: 4)
+    }
+
+    private var scanProgress: Double {
+        guard viewModel.totalBatches > 0 else { return 0 }
+        return min(1, Double(viewModel.currentBatch) / Double(viewModel.totalBatches))
+    }
+
+    // MARK: Card pager
+
+    private var cardPager: some View {
+        GeometryReader { geo in
+            ScrollViewReader { _ in
+                ScrollView(.horizontal, showsIndicators: false) {
+                    LazyHStack(spacing: 0) {
+                        ForEach(viewModel.stacks) { stack in
+                            StackCard(
+                                stack: stack,
+                                viewModel: viewModel,
+                                onOpenViewer: { fullScreenStack = stack }
+                            )
+                            .frame(width: geo.size.width)
+                            .id(AnyHashable(stack.id))
                         }
-                        .scrollTargetBehavior(.viewAligned)
-                        .scrollPosition(id: $currentStackID)
-                        // When a new batch loads, stay on the current card —
-                        // do NOT jump anywhere. The new cards appear at the end
-                        // and the user can swipe to them naturally.
-                        .onChange(of: viewModel.stacks.count) { _, _ in
-                            // Intentionally empty — we don't move the scroll
-                            // position when new stacks arrive.
+
+                        if viewModel.hasMoreBatches {
+                            NextBatchCard(viewModel: viewModel)
+                                .frame(width: geo.size.width)
+                                .id(AnyHashable("next-batch"))
                         }
                     }
+                    .scrollTargetLayout()
                 }
+                .scrollTargetBehavior(.viewAligned)
+                .scrollPosition(id: $currentStackID)
             }
         }
     }
 
-    // MARK: - Next Batch UI
+    // MARK: Empty state
 
-    private var nextBatchCard: some View {
-        VStack(spacing: 24) {
+    private var emptyState: some View {
+        VStack(spacing: 20) {
             Spacer()
-            Image(systemName: "arrow.down.circle")
-                .font(.system(size: 56))
-                .foregroundStyle(.tint)
-            VStack(spacing: 8) {
-                Text("All done with this batch!")
+            ZStack {
+                Circle()
+                    .fill(.green.opacity(0.10))
+                    .frame(width: 96, height: 96)
+                Image(systemName: "checkmark")
+                    .font(.system(size: 38, weight: .semibold))
+                    .foregroundStyle(.green)
+            }
+            VStack(spacing: 6) {
+                Text(viewModel.hasMoreBatches ? "Nothing to clean here" : "Your library is tidy")
                     .font(.title3.weight(.semibold))
-                Text("Batches keep memory usage low.\nTap below to scan the next 250 photos.")
+                Text(viewModel.hasMoreBatches
+                     ? "No duplicate groups in this batch."
+                     : "No more duplicate groups were found.")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
+                    .padding(.horizontal, 40)
             }
-            nextBatchButton
+            if viewModel.hasMoreBatches {
+                NextBatchButton(viewModel: viewModel)
+                    .padding(.horizontal, 32)
+                    .padding(.top, 4)
+            }
             Spacer()
         }
-        .padding(.horizontal, 16)
-    }
-
-    private var nextBatchButton: some View {
-        Button {
-            Task { await viewModel.loadNextBatch() }
-        } label: {
-            Group {
-                if viewModel.isLoadingNextBatch {
-                    ProgressView().tint(.white)
-                } else {
-                    Label("Load Next Batch (\(viewModel.currentBatch)/\(viewModel.totalBatches))",
-                          systemImage: "arrow.clockwise")
-                        .font(.subheadline.weight(.semibold))
-                }
-            }
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 16)
-            .background(.tint, in: RoundedRectangle(cornerRadius: 14))
-            .foregroundStyle(.white)
-        }
-        .padding(.horizontal, 32)
-        .disabled(viewModel.isLoadingNextBatch)
     }
 }
 
@@ -188,254 +232,470 @@ struct SmartStackView: View {
 private struct StackCard: View {
     let stack: SmartStack
     @ObservedObject var viewModel: SmartStackViewModel
+    let onOpenViewer: () -> Void
+
     @State private var showDeleteConfirm = false
 
     var body: some View {
-        GeometryReader { geometry in
-            VStack(spacing: 12) {
+        VStack(spacing: 0) {
+            heroSection
+                .padding(.horizontal, 16)
+                .padding(.top, 4)
 
-                // Hero image
-                ZStack(alignment: .topLeading) {
-                    Image(uiImage: stack.hero.image)
-                        .resizable()
-                        .scaledToFill()
-                        .frame(maxWidth: .infinity)
-                        .frame(height: heroHeight(in: geometry.size.height))
-                        .clipShape(RoundedRectangle(cornerRadius: 20))
-                        .shadow(color: .black.opacity(0.12), radius: 8, y: 4)
-                        // Animate smoothly when the hero changes — no zoom,
-                        // just a cross-fade driven by the id change.
-                        .animation(.easeInOut(duration: 0.25), value: stack.hero.id)
+            metaRow
+                .padding(.horizontal, 24)
+                .padding(.top, 14)
+                .padding(.bottom, 12)
 
-                    // Show "AI Pick" badge on hero only when it's the top pick,
-                    // so the user always knows if they're viewing the AI's choice.
-                    if stack.hero.isTopPick {
-                        Label("AI Pick", systemImage: "sparkles")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(.white)
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 5)
-                            .background(.tint.opacity(0.85), in: Capsule())
-                            .padding(12)
-                    } else {
-                        Label("Viewing", systemImage: "eye")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(.white)
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 5)
-                            .background(.ultraThinMaterial, in: Capsule())
-                            .padding(12)
-                    }
-                }
+            thumbnailTray
+                .padding(.bottom, 6)
 
-                // Quality indicators
-                HStack(spacing: 16) {
-                    QualityPill(icon: "camera.aperture",
-                                label: "Sharpness",
-                                value: stack.hero.sharpness,
-                                maxValue: 0.15)
-                    QualityPill(icon: "heart",
-                                label: "Your taste",
-                                value: max(0, 1 - stack.hero.tasteScore),
-                                maxValue: 1)
-                    Spacer()
-                    // BUG FIX 2 — count label now reflects total stack size
-                    Text("\(stack.photos.count) photos")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                .padding(.horizontal, 4)
+            Spacer(minLength: 8)
 
-                // BUG FIX 2 — Tray now shows ALL photos including the hero.
-                // BUG FIX 3 — Selected frame around the current hero thumbnail.
-                // BUG FIX 4 — Persistent sparkle badge on the AI's top pick.
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 10) {
-                        ForEach(stack.photos) { photo in
-                            TrayThumbnail(
-                                photo: photo,
-                                isSelected: photo.id == stack.hero.id,   // fix 3
-                                isAIPick: photo.isTopPick                 // fix 4
-                            ) {
-                                // Tapping the current hero is a no-op
-                                if photo.id != stack.hero.id {
-                                    viewModel.promotePhoto(photo, in: stack)
-                                }
-                            }
-                        }
-                    }
-                    .padding(.horizontal, 4)
-                    .padding(.vertical, 6)
-                }
-                .frame(height: 96)
-
-                // Action buttons
-                HStack(spacing: 12) {
-                    Button {
-                        viewModel.skipStack(stack)
-                    } label: {
-                        Label("Skip", systemImage: "arrow.right")
-                            .font(.subheadline.weight(.medium))
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 14)
-                            .background(.quaternary, in: RoundedRectangle(cornerRadius: 14))
-                    }
-                    .foregroundStyle(.primary)
-
-                    Button { showDeleteConfirm = true } label: {
-                        // "Delete X" now means everything except the hero
-                        Label("Keep Best & Delete \(stack.photos.count - 1)", systemImage: "trash")
-                            .font(.subheadline.weight(.semibold))
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 14)
-                            .background(.red, in: RoundedRectangle(cornerRadius: 14))
-                    }
-                    .foregroundStyle(.white)
-                }
-            }
-            .padding(.horizontal, 16)
-            .padding(.bottom, 8)
+            actionBar
+                .padding(.horizontal, 16)
+                .padding(.bottom, 8)
         }
         .confirmationDialog(
-            "Delete \(stack.photos.count - 1) photo\(stack.photos.count - 1 == 1 ? "" : "s")?",
+            "Delete \(stack.discardCount) photo\(stack.discardCount == 1 ? "" : "s")?",
             isPresented: $showDeleteConfirm,
             titleVisibility: .visible
         ) {
-            Button("Delete \(stack.photos.count - 1) photo\(stack.photos.count - 1 == 1 ? "" : "s")",
+            Button("Delete \(stack.discardCount) photo\(stack.discardCount == 1 ? "" : "s")",
                    role: .destructive) {
                 Task { await viewModel.keepHeroDeleteRest(in: stack) }
             }
             Button("Cancel", role: .cancel) { }
         } message: {
-            Text("The top pick will be kept. This cannot be undone.")
+            Text("The selected photo will be kept. This cannot be undone.")
         }
     }
 
-    private func heroHeight(in h: CGFloat) -> CGFloat { h * 0.45 }
+    // MARK: Hero
+
+    private var heroSection: some View {
+        GeometryReader { geo in
+            Button(action: onOpenViewer) {
+                ZStack(alignment: .topLeading) {
+                    Image(uiImage: stack.hero.image)
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: geo.size.width, height: geo.size.height)
+                        .clipped()
+                        .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
+
+                    // Bottom gradient for badge legibility
+                    LinearGradient(
+                        colors: [.clear, .black.opacity(0.45)],
+                        startPoint: .center, endPoint: .bottom
+                    )
+                    .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
+                    .allowsHitTesting(false)
+
+                    HStack {
+                        pickBadge
+                        Spacer()
+                        tapHintBadge
+                    }
+                    .padding(14)
+                    .frame(maxWidth: .infinity, alignment: .topLeading)
+
+                    VStack {
+                        Spacer()
+                        HStack(alignment: .bottom) {
+                            heroFooterText
+                            Spacer()
+                            sizeBadge
+                        }
+                        .padding(14)
+                    }
+                }
+                .animation(.easeInOut(duration: 0.25), value: stack.hero.id)
+            }
+            .buttonStyle(.plain)
+            .shadow(color: .black.opacity(0.18), radius: 20, x: 0, y: 10)
+        }
+        .aspectRatio(3.0/4.0, contentMode: .fit)
+    }
+
+    @ViewBuilder
+    private var pickBadge: some View {
+        if stack.hero.isTopPick {
+            Label("AI Pick", systemImage: "sparkles")
+                .font(.caption.weight(.bold))
+                .foregroundStyle(.white)
+                .padding(.horizontal, 11)
+                .padding(.vertical, 6)
+                .background(
+                    LinearGradient(
+                        colors: [.purple, .accentColor],
+                        startPoint: .leading, endPoint: .trailing),
+                    in: Capsule()
+                )
+                .shadow(color: .accentColor.opacity(0.35), radius: 8, y: 3)
+        } else {
+            Label("Your pick", systemImage: "hand.tap.fill")
+                .font(.caption.weight(.bold))
+                .foregroundStyle(.white)
+                .padding(.horizontal, 11)
+                .padding(.vertical, 6)
+                .background(.ultraThinMaterial, in: Capsule())
+                .overlay(Capsule().stroke(.white.opacity(0.25), lineWidth: 1))
+        }
+    }
+
+    private var tapHintBadge: some View {
+        Label("Tap to view", systemImage: "arrow.up.left.and.arrow.down.right")
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(.white)
+            .padding(.horizontal, 9)
+            .padding(.vertical, 5)
+            .background(.black.opacity(0.35), in: Capsule())
+    }
+
+    @ViewBuilder
+    private var heroFooterText: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            if !stack.hero.isTopPick {
+                Button {
+                    if let aiPick = stack.photos.first(where: { $0.isTopPick }) {
+                        viewModel.promotePhoto(aiPick, in: stack)
+                    }
+                } label: {
+                    Label("Restore AI Pick", systemImage: "arrow.uturn.backward")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 9)
+                        .padding(.vertical, 5)
+                        .background(.ultraThinMaterial, in: Capsule())
+                }
+                .buttonStyle(.plain)
+            }
+        }
+    }
+
+    private var sizeBadge: some View {
+        Text("\(stack.photos.count) photos")
+            .font(.caption2.weight(.semibold).monospacedDigit())
+            .foregroundStyle(.white)
+            .padding(.horizontal, 9)
+            .padding(.vertical, 5)
+            .background(.black.opacity(0.35), in: Capsule())
+    }
+
+    // MARK: Meta row
+
+    private var metaRow: some View {
+        HStack(spacing: 10) {
+            QualityChip(
+                icon: "camera.aperture",
+                label: "Sharpness",
+                value: stack.hero.sharpness,
+                maxValue: 0.15
+            )
+            QualityChip(
+                icon: "heart.fill",
+                label: "Your taste",
+                value: max(0, 1 - stack.hero.tasteScore),
+                maxValue: 1
+            )
+        }
+    }
+
+    // MARK: Thumbnail tray
+
+    private var thumbnailTray: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("All \(stack.photos.count) in this group")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Spacer()
+            }
+            .padding(.horizontal, 24)
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 10) {
+                    ForEach(stack.photos) { photo in
+                        TrayThumbnail(
+                            photo: photo,
+                            isSelected: photo.id == stack.hero.id
+                        ) {
+                            if photo.id != stack.hero.id {
+                                viewModel.promotePhoto(photo, in: stack)
+                                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                            }
+                        }
+                    }
+                }
+                .padding(.horizontal, 20)
+                .padding(.vertical, 6)
+            }
+        }
+    }
+
+    // MARK: Action bar
+
+    private var actionBar: some View {
+        HStack(spacing: 12) {
+            Button {
+                UIImpactFeedbackGenerator(style: .soft).impactOccurred()
+                viewModel.skipStack(stack)
+            } label: {
+                Label("Skip", systemImage: "arrow.right")
+                    .font(.subheadline.weight(.semibold))
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 52)
+                    .foregroundStyle(.primary)
+                    .background(
+                        RoundedRectangle(cornerRadius: 16, style: .continuous)
+                            .fill(Color(.secondarySystemBackground))
+                    )
+            }
+
+            Button {
+                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                showDeleteConfirm = true
+            } label: {
+                Label("Keep best · Delete \(stack.discardCount)",
+                      systemImage: "trash.fill")
+                    .font(.subheadline.weight(.bold))
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 52)
+                    .foregroundStyle(.white)
+                    .background(
+                        RoundedRectangle(cornerRadius: 16, style: .continuous)
+                            .fill(LinearGradient(
+                                colors: [Color.red, Color.red.opacity(0.85)],
+                                startPoint: .top, endPoint: .bottom))
+                    )
+                    .shadow(color: .red.opacity(0.35), radius: 14, y: 6)
+            }
+        }
+    }
 }
 
 // MARK: - TrayThumbnail
-//
-// Three visual states communicated simultaneously:
-//   isSelected  → blue border (you are here)
-//   isAIPick    → sparkle badge (AI's recommendation, always visible)
-//   blur warning → orange triangle (technical quality flag)
-//
-// A thumbnail can be both the AI pick AND selected (when the user
-// hasn't changed the hero), in which case both indicators show.
 
 private struct TrayThumbnail: View {
     let photo: RankedPhoto
-    let isSelected: Bool   // currently shown as the hero
-    let isAIPick: Bool     // AI's top pick, regardless of selection
+    let isSelected: Bool
     let onTap: () -> Void
 
     var body: some View {
         Button(action: onTap) {
-            ZStack(alignment: .bottomTrailing) {
+            ZStack {
                 Image(uiImage: photo.image)
                     .resizable()
                     .scaledToFill()
-                    .frame(width: 72, height: 72)
-                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                    .frame(width: 78, height: 78)
+                    .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
 
-                // Blur warning — bottom trailing
+                if photo.isTopPick {
+                    VStack {
+                        HStack {
+                            Spacer()
+                            Image(systemName: "sparkles")
+                                .font(.system(size: 9, weight: .bold))
+                                .foregroundStyle(.white)
+                                .padding(4)
+                                .background(
+                                    LinearGradient(
+                                        colors: [.purple, .accentColor],
+                                        startPoint: .leading, endPoint: .trailing),
+                                    in: Circle()
+                                )
+                                .offset(x: 4, y: -4)
+                        }
+                        Spacer()
+                    }
+                }
+
                 if photo.sharpness < 0.015 {
-                    Image(systemName: "drop.triangle.fill")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.white)
-                        .padding(3)
-                        .background(.orange, in: Circle())
-                        .offset(x: 4, y: 4)
+                    VStack {
+                        Spacer()
+                        HStack {
+                            Spacer()
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .font(.system(size: 9, weight: .bold))
+                                .foregroundStyle(.white)
+                                .padding(4)
+                                .background(.orange, in: Circle())
+                                .offset(x: 4, y: 4)
+                        }
+                    }
                 }
             }
-            .overlay(alignment: .topTrailing) {
-                // BUG FIX 4 — AI pick sparkle badge, top trailing, always visible
-                if isAIPick {
-                    Image(systemName: "sparkles")
-                        .font(.system(size: 10, weight: .bold))
-                        .foregroundStyle(.white)
-                        .padding(3)
-                        .background(.tint, in: Circle())
-                        .offset(x: 4, y: -4)
-                }
-            }
+            .frame(width: 78, height: 78)
+            .overlay(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .stroke(
+                        isSelected ? Color.accentColor : Color.clear,
+                        lineWidth: 3
+                    )
+            )
+            .scaleEffect(isSelected ? 1.05 : 1.0)
+            .opacity(isSelected ? 1.0 : 0.7)
+            .animation(.spring(response: 0.3, dampingFraction: 0.7), value: isSelected)
         }
         .buttonStyle(.plain)
-        // BUG FIX 3 — selected frame: blue border for the current hero,
-        // subtle gray border for everything else.
-        .overlay(
-            RoundedRectangle(cornerRadius: 10)
-                .stroke(
-                    isSelected ? Color.accentColor : Color.secondary.opacity(0.25),
-                    lineWidth: isSelected ? 2.5 : 1
-                )
-        )
-        // Dim thumbnails that aren't selected so the hero stands out in the tray
-        .opacity(isSelected ? 1.0 : 0.75)
-        .animation(.easeInOut(duration: 0.2), value: isSelected)
     }
 }
 
-// MARK: - QualityPill
+// MARK: - QualityChip
 
-private struct QualityPill: View {
+private struct QualityChip: View {
     let icon: String
     let label: String
     let value: Float
     let maxValue: Float
 
     private var normalised: Double { Double(min(value / maxValue, 1)) }
-    private var color: Color { normalised > 0.6 ? .green : normalised > 0.3 ? .orange : .red }
+    private var color: Color {
+        normalised > 0.6 ? .green : normalised > 0.3 ? .orange : .red
+    }
 
     var body: some View {
-        HStack(spacing: 5) {
-            Image(systemName: icon).font(.caption2).foregroundStyle(color)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(label).font(.caption2).foregroundStyle(.secondary)
+        HStack(spacing: 10) {
+            Image(systemName: icon)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(color)
+                .frame(width: 22, height: 22)
+                .background(color.opacity(0.15), in: Circle())
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(label)
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(.secondary)
                 GeometryReader { geo in
                     ZStack(alignment: .leading) {
-                        Capsule().fill(Color.secondary.opacity(0.15)).frame(height: 4)
-                        Capsule().fill(color)
-                            .frame(width: geo.size.width * normalised, height: 4)
+                        Capsule()
+                            .fill(Color.secondary.opacity(0.12))
+                        Capsule()
+                            .fill(color)
+                            .frame(width: geo.size.width * normalised)
                     }
                 }
                 .frame(height: 4)
             }
         }
-        .frame(width: 110)
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 8)
+        .padding(.horizontal, 12)
+        .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
     }
 }
 
-// MARK: - LoadingView
+// MARK: - NextBatchCard / NextBatchButton
 
-private struct LoadingView: View {
+private struct NextBatchCard: View {
+    @ObservedObject var viewModel: SmartStackViewModel
+
+    var body: some View {
+        VStack(spacing: 20) {
+            Spacer()
+            ZStack {
+                Circle()
+                    .fill(Color.accentColor.opacity(0.12))
+                    .frame(width: 96, height: 96)
+                Image(systemName: "arrow.down.circle.fill")
+                    .font(.system(size: 44))
+                    .foregroundStyle(.tint)
+            }
+            VStack(spacing: 6) {
+                Text("Batch reviewed")
+                    .font(.title3.weight(.semibold))
+                Text("Tap to scan the next 250 photos.\nWe load them in chunks to keep things smooth.")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 24)
+            }
+            NextBatchButton(viewModel: viewModel)
+                .padding(.horizontal, 32)
+                .padding(.top, 4)
+            Spacer()
+        }
+    }
+}
+
+private struct NextBatchButton: View {
+    @ObservedObject var viewModel: SmartStackViewModel
+
+    var body: some View {
+        Button {
+            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+            Task { await viewModel.loadNextBatch() }
+        } label: {
+            HStack {
+                if viewModel.isLoadingNextBatch {
+                    ProgressView().tint(.white)
+                } else {
+                    Image(systemName: "arrow.clockwise")
+                    Text("Load next batch")
+                        .monospacedDigit()
+                    Text("\(viewModel.currentBatch)/\(viewModel.totalBatches)")
+                        .monospacedDigit()
+                        .opacity(0.7)
+                }
+            }
+            .font(.subheadline.weight(.bold))
+            .foregroundStyle(.white)
+            .frame(maxWidth: .infinity)
+            .frame(height: 52)
+            .background(
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .fill(LinearGradient(
+                        colors: [.accentColor, .accentColor.opacity(0.85)],
+                        startPoint: .top, endPoint: .bottom))
+            )
+            .shadow(color: .accentColor.opacity(0.35), radius: 14, y: 6)
+        }
+        .disabled(viewModel.isLoadingNextBatch)
+    }
+}
+
+// MARK: - StatusView (loading)
+
+private struct StatusView: View {
     let icon: String
+    let tint: Color
     let title: String
     let subtitle: String
     var progress: Double? = nil
 
     var body: some View {
-        VStack(spacing: 20) {
-            Image(systemName: icon)
-                .font(.system(size: 48))
-                .foregroundStyle(.tint)
-                .symbolEffect(.pulse)
-            Text(title).font(.title3.weight(.semibold))
-            Text(subtitle)
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .padding(.horizontal, 32)
-            if let progress {
-                ProgressView(value: progress)
-                    .tint(.accentColor)
-                    .frame(width: 220)
-                Text("\(Int(progress * 100))%")
-                    .font(.caption.monospacedDigit())
+        VStack(spacing: 24) {
+            ZStack {
+                Circle()
+                    .fill(tint.opacity(0.12))
+                    .frame(width: 110, height: 110)
+                Image(systemName: icon)
+                    .font(.system(size: 44))
+                    .foregroundStyle(tint)
+                    .symbolEffect(.pulse, options: .repeating)
+            }
+
+            VStack(spacing: 6) {
+                Text(title)
+                    .font(.title3.weight(.semibold))
+                Text(subtitle)
+                    .font(.subheadline)
                     .foregroundStyle(.secondary)
+                    .monospacedDigit()
+            }
+
+            if let progress {
+                VStack(spacing: 6) {
+                    ProgressView(value: progress)
+                        .tint(tint)
+                        .frame(width: 240)
+                    Text("\(Int(progress * 100))%")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.tertiary)
+                }
             } else {
-                ProgressView()
+                ProgressView().controlSize(.small)
             }
         }
         .padding(40)
@@ -446,18 +706,318 @@ private struct LoadingView: View {
 
 private struct ErrorView: View {
     let message: String
-    var systemImage: String = "exclamationmark.triangle"
     let retry: () -> Void
 
     var body: some View {
         VStack(spacing: 20) {
-            Image(systemName: systemImage).font(.system(size: 48)).foregroundStyle(.secondary)
+            ZStack {
+                Circle()
+                    .fill(.red.opacity(0.10))
+                    .frame(width: 96, height: 96)
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 40))
+                    .foregroundStyle(.red)
+            }
+            Text("Something went wrong")
+                .font(.title3.weight(.semibold))
             Text(message)
-                .font(.subheadline).foregroundStyle(.secondary)
-                .multilineTextAlignment(.center).padding(.horizontal, 40)
-            if systemImage == "exclamationmark.triangle" {
-                Button("Try Again", action: retry).buttonStyle(.borderedProminent)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 40)
+            Button("Try again", action: retry)
+                .font(.subheadline.weight(.bold))
+                .foregroundStyle(.white)
+                .padding(.horizontal, 24)
+                .frame(height: 48)
+                .background(.tint, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        }
+    }
+}
+
+// MARK: - FullScreenPhotoViewer
+
+private struct FullScreenPhotoViewer: View {
+    let stackID: UUID
+    @ObservedObject var viewModel: SmartStackViewModel
+    @Environment(\.dismiss) private var dismiss
+
+    // Track selection by photo ID so the user stays on the same photo
+    // even if the stack changes underneath.
+    @State private var currentPhotoID: String? = nil
+
+    private var stack: SmartStack? {
+        viewModel.stacks.first(where: { $0.id == stackID })
+    }
+
+    var body: some View {
+        ZStack {
+            Color.black.ignoresSafeArea()
+
+            if let stack {
+                content(stack: stack)
+            } else {
+                // Stack vanished (deleted, skipped) — close politely.
+                Color.clear.onAppear { dismiss() }
             }
         }
+        .statusBarHidden()
+    }
+
+    private func content(stack: SmartStack) -> some View {
+        let selectionBinding = Binding<Int>(
+            get: {
+                stack.photos.firstIndex(where: { $0.id == currentPhotoID })
+                    ?? stack.photos.firstIndex(where: { $0.id == stack.hero.id })
+                    ?? 0
+            },
+            set: { newIndex in
+                if stack.photos.indices.contains(newIndex) {
+                    currentPhotoID = stack.photos[newIndex].id
+                }
+            }
+        )
+
+        let currentPhoto = stack.photos.first(where: { $0.id == currentPhotoID }) ?? stack.hero
+
+        return ZStack {
+            TabView(selection: selectionBinding) {
+                ForEach(Array(stack.photos.enumerated()), id: \.element.id) { index, photo in
+                    ZoomablePhoto(photo: photo, viewModel: viewModel)
+                        .tag(index)
+                }
+            }
+            .tabViewStyle(.page(indexDisplayMode: .never))
+
+            VStack {
+                topBar(stack: stack, selection: selectionBinding, currentPhoto: currentPhoto)
+                Spacer()
+                bottomBar(stack: stack, currentPhoto: currentPhoto)
+            }
+        }
+        .onAppear {
+            if currentPhotoID == nil {
+                currentPhotoID = stack.hero.id
+            }
+        }
+    }
+
+    // MARK: Top bar
+
+    private func topBar(stack: SmartStack,
+                        selection: Binding<Int>,
+                        currentPhoto: RankedPhoto) -> some View {
+        HStack {
+            Button {
+                dismiss()
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 16, weight: .bold))
+                    .foregroundStyle(.white)
+                    .frame(width: 38, height: 38)
+                    .background(.ultraThinMaterial, in: Circle())
+            }
+
+            Spacer()
+
+            VStack(spacing: 4) {
+                Text("\(selection.wrappedValue + 1) of \(stack.photos.count)")
+                    .font(.footnote.weight(.semibold).monospacedDigit())
+                    .foregroundStyle(.white)
+                if currentPhoto.isTopPick {
+                    Label("AI Pick", systemImage: "sparkles")
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(
+                            LinearGradient(
+                                colors: [.purple, .accentColor],
+                                startPoint: .leading, endPoint: .trailing),
+                            in: Capsule()
+                        )
+                } else if currentPhoto.id == stack.hero.id {
+                    Label("Your pick", systemImage: "hand.tap.fill")
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(.ultraThinMaterial, in: Capsule())
+                }
+            }
+
+            Spacer()
+
+            Color.clear.frame(width: 38, height: 38)
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, 8)
+    }
+
+    // MARK: Bottom bar
+
+    private func bottomBar(stack: SmartStack, currentPhoto: RankedPhoto) -> some View {
+        VStack(spacing: 14) {
+            HStack(spacing: 10) {
+                DarkChip(
+                    icon: "camera.aperture",
+                    label: "Sharpness",
+                    value: currentPhoto.sharpness,
+                    maxValue: 0.15
+                )
+                DarkChip(
+                    icon: "heart.fill",
+                    label: "Your taste",
+                    value: max(0, 1 - currentPhoto.tasteScore),
+                    maxValue: 1
+                )
+            }
+
+            if currentPhoto.id != stack.hero.id {
+                Button {
+                    UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                    viewModel.promotePhoto(currentPhoto, in: stack)
+                } label: {
+                    Label("Keep this one", systemImage: "checkmark.circle.fill")
+                        .font(.subheadline.weight(.bold))
+                        .foregroundStyle(.black)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 52)
+                        .background(
+                            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                .fill(Color.white)
+                        )
+                }
+            } else {
+                Label("This is the photo to keep", systemImage: "checkmark.seal.fill")
+                    .font(.subheadline.weight(.bold))
+                    .foregroundStyle(.white)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 52)
+                    .background(
+                        RoundedRectangle(cornerRadius: 16, style: .continuous)
+                            .fill(.ultraThinMaterial)
+                    )
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.bottom, 24)
+    }
+}
+
+// MARK: - ZoomablePhoto (single zoomable page)
+
+private struct ZoomablePhoto: View {
+    let photo: RankedPhoto
+    @ObservedObject var viewModel: SmartStackViewModel
+
+    @State private var highRes: UIImage? = nil
+    @State private var scale: CGFloat = 1.0
+    @State private var lastScale: CGFloat = 1.0
+    @State private var offset: CGSize = .zero
+    @State private var lastOffset: CGSize = .zero
+
+    var body: some View {
+        GeometryReader { geo in
+            ZStack {
+                Image(uiImage: highRes ?? photo.image)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: geo.size.width, height: geo.size.height)
+                    .scaleEffect(scale)
+                    .offset(offset)
+                    .gesture(
+                        SimultaneousGesture(
+                            MagnificationGesture()
+                                .onChanged { value in
+                                    scale = max(1, min(lastScale * value, 5))
+                                }
+                                .onEnded { _ in
+                                    lastScale = scale
+                                    if scale <= 1 {
+                                        withAnimation(.spring()) {
+                                            scale = 1
+                                            offset = .zero
+                                            lastOffset = .zero
+                                            lastScale = 1
+                                        }
+                                    }
+                                },
+                            DragGesture()
+                                .onChanged { value in
+                                    guard scale > 1 else { return }
+                                    offset = CGSize(
+                                        width: lastOffset.width + value.translation.width,
+                                        height: lastOffset.height + value.translation.height
+                                    )
+                                }
+                                .onEnded { _ in
+                                    lastOffset = offset
+                                }
+                        )
+                    )
+                    .onTapGesture(count: 2) {
+                        withAnimation(.spring(response: 0.35, dampingFraction: 0.75)) {
+                            if scale > 1 {
+                                scale = 1
+                                offset = .zero
+                                lastOffset = .zero
+                                lastScale = 1
+                            } else {
+                                scale = 2.5
+                                lastScale = 2.5
+                            }
+                        }
+                    }
+            }
+        }
+        .task(id: photo.id) {
+            let img = await viewModel.loadFullResolutionImage(for: photo.asset)
+            if let img { highRes = img }
+        }
+    }
+}
+
+// MARK: - DarkChip (used inside the dark viewer)
+
+private struct DarkChip: View {
+    let icon: String
+    let label: String
+    let value: Float
+    let maxValue: Float
+
+    private var normalised: Double { Double(min(value / maxValue, 1)) }
+    private var color: Color {
+        normalised > 0.6 ? .green : normalised > 0.3 ? .orange : .red
+    }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: icon)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(color)
+                .frame(width: 20, height: 20)
+                .background(color.opacity(0.20), in: Circle())
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(label)
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(.white.opacity(0.7))
+                GeometryReader { geo in
+                    ZStack(alignment: .leading) {
+                        Capsule()
+                            .fill(.white.opacity(0.15))
+                        Capsule()
+                            .fill(color)
+                            .frame(width: geo.size.width * normalised)
+                    }
+                }
+                .frame(height: 4)
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 8)
+        .padding(.horizontal, 12)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
     }
 }

@@ -218,6 +218,9 @@ class PhotoAnalyzer: ObservableObject {
     // For each favorite: classify it → fingerprint it → append to the right bucket.
     // Both classification and fingerprinting share a single VNImageRequestHandler
     // per image (same pixel decode, three models: face + scene + feature print).
+    //
+    // FIX: replaced isSynchronous=true with a DispatchSemaphore so
+    // PHImageManager is never called synchronously off the main thread.
 
     func buildTasteProfile(sampleLimit: Int = 100) async {
         let profile: [PhotoCategory: [VNFeaturePrintObservation]] =
@@ -238,20 +241,30 @@ class PhotoAnalyzer: ObservableObject {
                 return d
             }()
 
+            // FIX: isSynchronous = false + semaphore instead of isSynchronous = true
             let imageOptions = PHImageRequestOptions()
-            imageOptions.isSynchronous = true
+            imageOptions.isSynchronous = false
             imageOptions.deliveryMode = .fastFormat
             imageOptions.resizeMode = .fast
+            imageOptions.isNetworkAccessAllowed = false
 
             assets.enumerateObjects { [self] asset, _, _ in
                 autoreleasepool {
                     var cgImage: CGImage?
+                    let sema = DispatchSemaphore(value: 0)
                     PHImageManager.default().requestImage(
                         for: asset,
                         targetSize: CGSize(width: 224, height: 224),
                         contentMode: .aspectFill,
                         options: imageOptions
-                    ) { image, _ in cgImage = image?.cgImage }
+                    ) { image, info in
+                        let isDegraded = (info?[PHImageResultIsDegradedKey] as? Bool) ?? false
+                        if !isDegraded {
+                            cgImage = image?.cgImage
+                            sema.signal()
+                        }
+                    }
+                    sema.wait()
 
                     guard let cg = cgImage else { return }
 
@@ -330,10 +343,8 @@ class PhotoAnalyzer: ObservableObject {
 
     // MARK: - 8. Fingerprint a batch (RAM-safe, category stored per asset)
     //
-    // fingerprintBatch now also categorises each photo during the same
-    // Vision pass, storing the category in FingerprintedAsset.
-    // No extra cost — face + classify requests piggyback on the feature
-    // print decode that was already happening.
+    // FIX: replaced isSynchronous=true with a DispatchSemaphore so
+    // PHImageManager is never called synchronously off the main thread.
 
     func fingerprintBatch(
         assets: [PHAsset],
@@ -344,8 +355,9 @@ class PhotoAnalyzer: ObservableObject {
             var results: [FingerprintedAsset] = []
             results.reserveCapacity(assets.count)
 
+            // FIX: isSynchronous = false + semaphore
             let imageOptions = PHImageRequestOptions()
-            imageOptions.isSynchronous = true
+            imageOptions.isSynchronous = false
             imageOptions.deliveryMode = .fastFormat
             imageOptions.resizeMode = .fast
             imageOptions.isNetworkAccessAllowed = false
@@ -353,12 +365,20 @@ class PhotoAnalyzer: ObservableObject {
             for (index, asset) in assets.enumerated() {
                 autoreleasepool {
                     var cgImage: CGImage?
+                    let sema = DispatchSemaphore(value: 0)
                     PHImageManager.default().requestImage(
                         for: asset,
                         targetSize: CGSize(width: 224, height: 224),
                         contentMode: .aspectFill,
                         options: imageOptions
-                    ) { image, _ in cgImage = image?.cgImage }
+                    ) { image, info in
+                        let isDegraded = (info?[PHImageResultIsDegradedKey] as? Bool) ?? false
+                        if !isDegraded {
+                            cgImage = image?.cgImage
+                            sema.signal()
+                        }
+                    }
+                    sema.wait()
 
                     guard let cg = cgImage else { return }
 
@@ -406,6 +426,8 @@ class PhotoAnalyzer: ObservableObject {
 
         for i in 0..<n {
             let windowEnd = min(i + windowSize, n - 1)
+            // CRASH: if i == n-1, then i+1 > windowEnd and (i+1)...windowEnd is invalid
+            guard i + 1 <= windowEnd else { continue }  // ← add this
             for j in (i + 1)...windowEnd {
                 if let dist = computeDistance(between: assets[i].fingerprint,
                                               and: assets[j].fingerprint), dist < threshold {
@@ -420,23 +442,36 @@ class PhotoAnalyzer: ObservableObject {
     }
 
     // MARK: - 10. Resolve a cluster into PhotoItems for scoring
+    //
+    // FIX: replaced isSynchronous=true with a DispatchSemaphore so
+    // PHImageManager is never called synchronously off the main thread.
 
     func resolveCluster(_ cluster: [FingerprintedAsset]) -> [PhotoItem] {
+        // FIX: isSynchronous = false + semaphore
         let imageOptions = PHImageRequestOptions()
-        imageOptions.isSynchronous = true
+        imageOptions.isSynchronous = false
         imageOptions.deliveryMode = .highQualityFormat
         imageOptions.resizeMode = .exact
+        imageOptions.isNetworkAccessAllowed = false
 
         var items: [PhotoItem] = []
         for fa in cluster {
             autoreleasepool {
                 var cgImage: CGImage?
+                let sema = DispatchSemaphore(value: 0)
                 PHImageManager.default().requestImage(
                     for: fa.asset,
                     targetSize: CGSize(width: 512, height: 512),
                     contentMode: .aspectFill,
                     options: imageOptions
-                ) { image, _ in cgImage = image?.cgImage }
+                ) { image, info in
+                    let isDegraded = (info?[PHImageResultIsDegradedKey] as? Bool) ?? false
+                    if !isDegraded {
+                        cgImage = image?.cgImage
+                        sema.signal()
+                    }
+                }
+                sema.wait()
 
                 if let cg = cgImage {
                     items.append(PhotoItem(asset: fa.asset, cgImage: cg))

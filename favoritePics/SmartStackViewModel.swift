@@ -15,18 +15,40 @@ struct RankedPhoto: Identifiable {
 }
 
 // MARK: - Smart Stack
+//
+// `photos` is stable in AI-ranking order so the thumbnail tray and
+// fullscreen swipe order never shuffle while the user is interacting.
+// `selectedID` tracks the user's current pick separately — defaults to
+// the AI's top pick on creation. Changing the selection no longer
+// reorders the array.
 
 struct SmartStack: Identifiable {
     let id = UUID()
     var photos: [RankedPhoto]
+    var selectedID: String
 
-    var hero: RankedPhoto { photos[0] }
-    var discardTray: [RankedPhoto] { Array(photos.dropFirst()) }
+    init(photos: [RankedPhoto]) {
+        self.photos = photos
+        self.selectedID = photos.first?.id ?? ""
+    }
+
+    var hero: RankedPhoto {
+        photos.first(where: { $0.id == selectedID }) ?? photos[0]
+    }
+
+    var discardTray: [RankedPhoto] {
+        photos.filter { $0.id != selectedID }
+    }
+
     var discardCount: Int { photos.count - 1 }
 
+    var aiPick: RankedPhoto? {
+        photos.first(where: { $0.isTopPick })
+    }
+
     mutating func promote(_ photo: RankedPhoto) {
-        guard let idx = photos.firstIndex(where: { $0.id == photo.id }) else { return }
-        photos.swapAt(0, idx)
+        guard photos.contains(where: { $0.id == photo.id }) else { return }
+        selectedID = photo.id
     }
 }
 
@@ -166,11 +188,15 @@ class SmartStackViewModel: ObservableObject {
         var newStacks: [SmartStack] = []
 
         for cluster in multiClusters {
-            // resolveCluster loads CGImages at 512px for sharpness scoring,
-            // then immediately releases them after scoring.
-            let items: [PhotoItem] = await Task.detached(priority: .userInitiated) { [analyzer] in
-                analyzer.resolveCluster(cluster)
-            }.value
+            // FIX: resolveCluster uses PHImageManager internally, which must
+            // not be called from Task.detached when using semaphore-based async.
+            // Run it on a dedicated background queue instead of a detached Task
+            // so the semaphore wait doesn't block the cooperative thread pool.
+            let items: [PhotoItem] = await withCheckedContinuation { continuation in
+                DispatchQueue.global(qos: .userInitiated).async { [analyzer] in
+                    continuation.resume(returning: analyzer.resolveCluster(cluster))
+                }
+            }
 
             var ranked: [RankedPhoto] = []
 
@@ -234,25 +260,45 @@ class SmartStackViewModel: ObservableObject {
 
     // MARK: - Helpers
 
+    // FIX: switched from .opportunistic (multi-callback, data race on didResume)
+    // to .highQualityFormat (single callback, no race possible).
     private func resolveDisplayImage(for asset: PHAsset) async -> UIImage {
         await withCheckedContinuation { continuation in
             let opts = PHImageRequestOptions()
             opts.isSynchronous = false
-            opts.deliveryMode = .opportunistic
+            opts.deliveryMode = .highQualityFormat  // single callback — no double-resume risk
             opts.resizeMode = .fast
+            opts.isNetworkAccessAllowed = false
 
-            var didResume = false
             PHImageManager.default().requestImage(
                 for: asset,
                 targetSize: CGSize(width: 800, height: 800),
                 contentMode: .aspectFill,
                 options: opts
-            ) { image, info in
-                let isDegraded = (info?[PHImageResultIsDegradedKey] as? Bool) ?? false
-                if !isDegraded && !didResume {
-                    didResume = true
-                    continuation.resume(returning: image ?? UIImage())
-                }
+            ) { image, _ in
+                continuation.resume(returning: image ?? UIImage())
+            }
+        }
+    }
+
+    // Loads a higher-resolution image on demand for the full-screen viewer.
+    // Bounded at 2400px on the long edge so pinch-zoom stays crisp without
+    // exhausting RAM the way PHImageManagerMaximumSize would.
+    func loadFullResolutionImage(for asset: PHAsset) async -> UIImage? {
+        await withCheckedContinuation { continuation in
+            let opts = PHImageRequestOptions()
+            opts.isSynchronous = false
+            opts.deliveryMode = .highQualityFormat
+            opts.resizeMode = .exact
+            opts.isNetworkAccessAllowed = true
+
+            PHImageManager.default().requestImage(
+                for: asset,
+                targetSize: CGSize(width: 2400, height: 2400),
+                contentMode: .aspectFit,
+                options: opts
+            ) { image, _ in
+                continuation.resume(returning: image)
             }
         }
     }
